@@ -7,6 +7,7 @@ Pipeline of LivePortrait
 import comfy.utils
 import comfy.model_management as mm
 import gc
+import pprint
 from tqdm import tqdm
 import numpy as np
 from .config.inference_config import InferenceConfig
@@ -91,7 +92,7 @@ class LivePortraitPipeline(object):
             )
             driving_rot_list.append(R_d)
 
-        if relative_motion_mode == "source_video_smoothed":
+        if relative_motion_mode == "source_video_smoothed" or relative_motion_mode == "expression_only":
             x_d_r_lst = []
             first_driving_rot = driving_rot_list[0].cpu().numpy().astype(np.float32).transpose(0, 2, 1)
             for i in tqdm(range(source_images_num), desc='Smoothing...', total=source_images_num):
@@ -151,6 +152,18 @@ class LivePortraitPipeline(object):
             elif relative_motion_mode == "source_video_smoothed":
                 R_new = driving_rot_list_smooth[i]
                 delta_new = driving_exp_list_smooth[i]
+                scale_new = x_s_info["scale"]
+                t_new = x_d_info["t"]
+            elif relative_motion_mode == "expression_only":
+                R_new = R_s
+                delta_new = x_s_info['exp'].clone();
+                # delta_new = driving_exp_list_smooth[i]
+                for idx in [1,2,6,11,12,13,14,15,16,17,18,19,20]:
+                    delta_new[:, idx, :] = driving_exp_list_smooth[i][idx, :]
+                delta_new[:, 3:5, 1] = driving_exp_list_smooth[i][3:5, 1]
+                delta_new[:, 5, 2] = driving_exp_list_smooth[i][5, 2]
+                delta_new[:, 8, 2] = driving_exp_list_smooth[i][8, 2]
+                delta_new[:, 9, 1:] = driving_exp_list_smooth[i][9, 1:]
                 scale_new = x_s_info["scale"]
                 t_new = x_d_info["t"]
             elif relative_motion_mode == "relative_rotation_only":

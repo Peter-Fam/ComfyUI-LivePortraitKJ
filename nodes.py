@@ -270,6 +270,7 @@ class LivePortraitProcess:
                     [
                         "relative",
                         "source_video_smoothed",
+                        "expression_only",
                         "relative_rotation_only",
                         "single_frame",
                         "off"
