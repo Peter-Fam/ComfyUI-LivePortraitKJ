@@ -16,10 +16,18 @@ from .live_portrait_wrapper import LivePortraitWrapper
 from .utils.retargeting_utils import calc_eye_close_ratio, calc_lip_close_ratio
 from .utils.filter import smooth
 from .utils.helper import calc_motion_multiplier
+import os.path as osp
+import pickle as pkl
+import torch
 
+
+def make_abs_path(fn):
+    return osp.join(osp.dirname(osp.realpath(__file__)), fn)
 import os
 script_directory = os.path.dirname(os.path.abspath(__file__))
-
+def load_lip_array():
+    with open(make_abs_path('./utils/resources/lip_array.pkl'), 'rb') as f:
+        return pkl.load(f)
 class LivePortraitPipeline(object):
     def __init__(
         self,
@@ -284,6 +292,152 @@ class LivePortraitPipeline(object):
 
                 if inference_cfg.flag_stitching:
                     x_d_i_new = self.live_portrait_wrapper.stitching(x_s, x_d_i_new)
+
+            if inference_cfg.flag_stitching:
+                x_d_i_new = self.live_portrait_wrapper.stitching(x_s, x_d_i_new)
+
+            out = self.live_portrait_wrapper.warp_decode(f_s, x_s, x_d_i_new)
+            
+            out_list.append(out)
+    
+            pbar.update(1)
+
+        out_dict = {
+            "out_list": out_list,
+            "crop_info": crop_info,
+            "mismatch_method": mismatch_method,
+        }
+
+        return out_dict
+
+    def silence_lips(
+        self,  crop_info,  delta_multiplier, relative_motion_mode="expression_only", driving_smooth_observation_variance=0.0003, mismatch_method="constant", 
+    ):
+        inference_cfg = self.live_portrait_wrapper.cfg
+        device = inference_cfg.device_id
+
+        out_list = []
+        R_d_0, x_d_0_info = None, None
+
+        source_images_num = len(crop_info["crop_info_list"])
+
+        total_frames = source_images_num
+
+        disable_progress_bar = True if relative_motion_mode == "single_frame" else False
+
+        source_info = crop_info["source_info"]
+        source_rot_list = crop_info["source_rot_list"]
+        f_s_list = crop_info["f_s_list"]
+        x_s_list = crop_info["x_s_list"]
+
+        driving_info = []
+        driving_exp_list = []
+        driving_rot_list = []
+        
+        for i in tqdm(range(total_frames), desc='Processing driving images...', total=total_frames, disable=disable_progress_bar):
+            #get driving keypoints info
+            safe_index = min(i, source_images_num - 1)
+            if crop_info["crop_info_list"][safe_index] is None:
+                driving_info.append(None)
+                driving_rot_list.append(None)
+                driving_exp_list.append(None)
+                if i == 0:
+                    raise ValueError("No face detected in FIRST source image")
+                continue
+            x_s_info = source_info[safe_index]
+            x_d_info = x_s_info
+            
+            if i == 0:
+                first = x_d_info
+
+            driving_info.append(x_d_info)
+
+            driving_exp = x_d_info['exp']
+            driving_exp_list.append(driving_exp.cpu())
+
+            R_d = get_rotation_matrix(
+                x_d_info["pitch"], x_d_info["yaw"], x_d_info["roll"]
+            )
+            driving_rot_list.append(R_d)
+
+        if relative_motion_mode == "source_video_smoothed" or relative_motion_mode == "expression_only":
+            x_d_r_lst = []
+            first_driving_rot = driving_rot_list[0].cpu().numpy().astype(np.float32).transpose(0, 2, 1)
+            for i in tqdm(range(source_images_num), desc='Smoothing...', total=source_images_num):
+                if driving_rot_list[i] is None:
+                    x_d_r_lst.append(None)
+                    continue
+                driving_rot = driving_rot_list[i].cpu().numpy().astype(np.float32)
+                source_rot = source_rot_list[i].cpu().numpy().astype(np.float32)
+                dot = np.dot(driving_rot, first_driving_rot) @ source_rot
+                x_d_r_lst.append(dot)
+  
+            driving_exp_list_smooth = smooth(driving_exp_list, source_info[0]["exp"].shape, device, observation_variance=driving_smooth_observation_variance)
+            driving_rot_list_smooth = smooth(x_d_r_lst, source_rot_list[0].shape, device, observation_variance=driving_smooth_observation_variance)
+
+        pbar = comfy.utils.ProgressBar(total_frames)
+
+        for i in tqdm(range(total_frames), desc='Animating...', total=total_frames, disable=disable_progress_bar):
+
+            safe_index = min(i, len(crop_info["crop_info_list"]) - 1)
+
+            # skip and return empty frames if no crop due to no face detected
+            if crop_info["crop_info_list"][safe_index] is None:
+                out_list.append({})
+                pbar.update(1)
+                continue
+
+            source_lmk = crop_info["crop_info_list"][safe_index]["lmk_crop"]
+            
+            x_d_info = driving_info[i]
+            R_d = driving_rot_list[i]
+
+            x_s_info = source_info[safe_index]
+            R_s = source_rot_list[safe_index]
+            f_s = f_s_list[safe_index]
+            x_s = x_s_list[safe_index]
+
+            x_c_s = x_s_info["kp"]
+
+
+            if relative_motion_mode == "source_video_smoothed":
+                R_new = driving_rot_list_smooth[i]
+                delta_new = driving_exp_list_smooth[i]
+                scale_new = x_s_info["scale"]
+                t_new = x_d_info["t"]
+            elif relative_motion_mode == "expression_only":
+                R_new = R_s
+                # Initialize delta_new with the full expression data
+                delta_new = x_s_info['exp'].clone()
+
+                # Create a tensor with zeros and the lip array
+                zeros_and_lip = torch.zeros_like(x_s_info['exp']) + torch.from_numpy(load_lip_array()).to(dtype=torch.float32, device=device)
+
+                # Define the indices to be replaced
+                # indices_to_replace = [1, 2, 6, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+                indices_to_replace = [1, 2, 6, 12, 14, 17, 19, 20]  ##indices_to_replace = [1, 2, 6, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+
+                # Replace specific indices with data from zeros_and_lip
+                for idx in indices_to_replace:
+                    delta_new[:, idx, :] = zeros_and_lip[:, idx, :]
+                # Additional specific replacements
+                delta_new[:, 3:5, 1] = zeros_and_lip[:, 3:5, 1]
+                delta_new[:, 5, 2] = zeros_and_lip[:, 5, 2]
+                delta_new[:, 8, 2] = zeros_and_lip[:, 8, 2]
+                delta_new[:, 9, 1:] = zeros_and_lip[:, 9, 1:]
+                scale_new = x_s_info["scale"]
+                t_new = x_d_info["t"]
+            else:
+                R_new = R_d
+                delta_new = x_s_info['exp']
+                scale_new = x_s_info["scale"]
+                t_new = x_d_info["t"]
+
+            t_new[..., 2].fill_(0)  # zero tz
+
+            delta_new = delta_new * delta_multiplier
+            
+            x_d_i_new = scale_new * (x_c_s @ R_new + delta_new) + t_new
 
             if inference_cfg.flag_stitching:
                 x_d_i_new = self.live_portrait_wrapper.stitching(x_s, x_d_i_new)

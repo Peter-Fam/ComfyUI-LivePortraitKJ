@@ -242,6 +242,70 @@ class DownloadAndLoadLivePortraitModels:
 
         return (pipeline,)
 
+class LivePortraitLipSilencing:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "pipeline": ("LIVEPORTRAITPIPE",),
+            "crop_info": ("CROPINFO", {"default": {}}),
+            "source_image": ("IMAGE",),
+            "delta_multiplier": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.001}),
+            "driving_smooth_observation_variance": ("FLOAT", {"default": 3e-6, "min": 1e-11, "max": 1e-2, "step": 1e-11}),
+            },
+        }
+
+    RETURN_TYPES = (
+        "IMAGE",
+        "LP_OUT",
+    )
+    RETURN_NAMES = (
+        "cropped_image",
+        "output",
+    )
+    FUNCTION = "process"
+    CATEGORY = "LivePortrait"
+
+    def process(
+        self,
+        source_image: torch.Tensor,
+        crop_info: dict,
+        pipeline: LivePortraitPipeline,
+        driving_smooth_observation_variance: float,
+        delta_multiplier: float = 1.0,
+    ):
+        pipeline.live_portrait_wrapper.cfg.flag_eye_retargeting = False
+        pipeline.live_portrait_wrapper.cfg.eyes_retargeting_multiplier = 1.0
+        pipeline.live_portrait_wrapper.cfg.flag_lip_retargeting = False
+        pipeline.live_portrait_wrapper.cfg.lip_retargeting_multiplier = 1.0
+        driving_landmarks = None
+
+        pipeline.live_portrait_wrapper.cfg.flag_stitching = True
+
+        
+        out = pipeline.silence_lips(
+            crop_info=crop_info, 
+            delta_multiplier=delta_multiplier,
+            relative_motion_mode='expression_only',
+            driving_smooth_observation_variance=driving_smooth_observation_variance,
+            mismatch_method="constant",
+        )
+
+        total_frames = len(out["out_list"])
+      
+        if total_frames > 1:
+            cropped_image_list = []
+            for i in (range(total_frames)):
+                if not out["out_list"][i]:
+                    cropped_image_list.append(torch.zeros(1, 512, 512, 3, dtype=torch.float32, device = "cpu"))
+                else:
+                    cropped_image = torch.clamp(out["out_list"][i]["out"], 0, 1).permute(0, 2, 3, 1).cpu()
+                    cropped_image_list.append(cropped_image)
+
+            cropped_out_tensors = torch.cat(cropped_image_list, dim=0)
+        else:
+            cropped_out_tensors = torch.clamp(out["out_list"][0]["out"], 0, 1).permute(0, 2, 3, 1)
+      
+        return (cropped_out_tensors, out,)
 
 class LivePortraitProcess:
     @classmethod
@@ -859,6 +923,7 @@ class KeypointScaler:
 NODE_CLASS_MAPPINGS = {
     "DownloadAndLoadLivePortraitModels": DownloadAndLoadLivePortraitModels,
     "LivePortraitProcess": LivePortraitProcess,
+    "LivePortraitLipSilencing": LivePortraitLipSilencing,
     "LivePortraitCropper": LivePortraitCropper,
     "LivePortraitRetargeting": LivePortraitRetargeting,
     #"KeypointScaler": KeypointScaler,
@@ -871,6 +936,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DownloadAndLoadLivePortraitModels": "(Down)Load LivePortraitModels",
     "LivePortraitProcess": "LivePortrait Process",
+    "LivePortraitLipSilencing": "LivePortrait Lip Silencing",
     "LivePortraitCropper": "LivePortrait Cropper",
     "LivePortraitRetargeting": "LivePortrait Retargeting",
     #"KeypointScaler": "KeypointScaler",
